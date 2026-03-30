@@ -1,0 +1,142 @@
+// from: https://workos.com/blog/private-key-jwt
+// by: Maria Paktiti
+// keeping a copy as an example
+// private-key-jwt-auth-code-end-to-end.js
+// End-to-end Node example:
+// 1) Redirect user to authorization endpoint to get an authorization code
+// 2) Handle callback and exchange code for tokens using private_key_jwt
+//
+// npm i express jose
+// Node 18+ recommended
+//
+// Env vars expected:
+//   CLIENT_ID=...
+//   AUTHORIZATION_ENDPOINT=https://idp.example.com/oauth/authorize
+//   TOKEN_ENDPOINT=https://idp.example.com/oauth/token
+//   REDIRECT_URI=http://localhost:3000/callback
+//   PRIVATE_KEY_PEM="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+// Optional:
+//   KEY_ID=your-kid
+//   SCOPES="openid profile email"   (space-separated)
+//   ISSUER=https://idp.example.com  (for discovery, if you want to verify id_token elsewhere)
+
+import express from "express";
+import crypto from "crypto";
+import { SignJWT, importPKCS8 } from "jose";
+
+const app = express();
+
+const clientId = process.env.CLIENT_ID;
+const authorizationEndpoint = process.env.AUTHORIZATION_ENDPOINT;
+const tokenEndpoint = process.env.TOKEN_ENDPOINT;
+const redirectUri = process.env.REDIRECT_URI;
+
+const privateKeyPem = process.env.PRIVATE_KEY_PEM;
+const kid = process.env.KEY_ID;
+
+const scopes = process.env.SCOPES || "openid profile email";
+
+if (!clientId || !authorizationEndpoint || !tokenEndpoint || !redirectUri || !privateKeyPem) {
+  throw new Error(
+    "Missing env vars: CLIENT_ID, AUTHORIZATION_ENDPOINT, TOKEN_ENDPOINT, REDIRECT_URI, PRIVATE_KEY_PEM"
+  );
+}
+
+// Very small in-memory store for demo purposes only.
+// In production: store per-user session (cookie session, Redis, etc).
+const stateStore = new Set();
+
+// --- Step A: Redirect user to get an authorization code ---
+app.get("/login", (req, res) => {
+  const state = crypto.randomUUID();
+  stateStore.add(state);
+
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    scope: scopes,
+    state,
+
+    // If your IdP requires PKCE even for confidential clients, add:
+    // code_challenge: "...",
+    // code_challenge_method: "S256",
+  });
+
+  const url = `${authorizationEndpoint}?${params.toString()}`;
+  res.redirect(url);
+});
+
+// --- Build private_key_jwt client assertion (for the token endpoint) ---
+async function buildClientAssertion() {
+  const alg = "RS256";
+  const privateKey = await importPKCS8(privateKeyPem, alg);
+
+  const now = Math.floor(Date.now() / 1000);
+  const exp = now + 5 * 60; // 5 minutes
+
+  return await new SignJWT({})
+    .setProtectedHeader({ alg, ...(kid ? { kid } : {}) })
+    .setIssuer(clientId)        // iss
+    .setSubject(clientId)       // sub
+    .setAudience(tokenEndpoint) // aud must exactly match the token endpoint
+    .setIssuedAt(now)
+    .setExpirationTime(exp)
+    .setJti(crypto.randomUUID())
+    .sign(privateKey);
+}
+
+// --- Step B: Handle callback and exchange code for tokens ---
+app.get("/callback", async (req, res) => {
+  const { code, state, error, error_description } = req.query;
+
+  if (error) {
+    return res.status(400).send(`Authorization error: ${error} ${error_description || ""}`);
+  }
+  if (!code || !state || typeof state !== "string") {
+    return res.status(400).send("Missing code or state");
+  }
+  if (!stateStore.has(state)) {
+    return res.status(400).send("Invalid state");
+  }
+  stateStore.delete(state);
+
+  try {
+    const clientAssertion = await buildClientAssertion();
+
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      code: String(code),
+      redirect_uri: redirectUri,
+
+      // private_key_jwt client authentication
+      client_id: clientId,
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      client_assertion: clientAssertion,
+    });
+
+    const tokenRes = await fetch(tokenEndpoint, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body,
+    });
+
+    const tokens = await tokenRes.json().catch(() => ({}));
+
+    if (!tokenRes.ok) {
+      return res
+        .status(400)
+        .json({ message: "Token exchange failed", status: tokenRes.status, tokens });
+    }
+
+    // tokens may include: access_token, id_token, refresh_token, expires_in, token_type, scope
+    res.json({ message: "✅ Success", tokens });
+  } catch (e) {
+    res.status(500).json({ message: "Unexpected error", error: e.message });
+  }
+});
+
+app.listen(3000, () => {
+  console.log("Listening on http://localhost:3000");
+  console.log("Visit http://localhost:3000/login to start the flow.");
+});
